@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 /**
  * ghostty-resurrect — back up & restore Ghostty tabs, panes, and the
- * Claude Code / Codex sessions running inside them.
+ * Claude Code / Codex / Amp sessions running inside them.
  *
  * Captures the full Ghostty layout (windows -> tabs -> panes) and, for every
- * pane running a Claude Code or Codex CLI session, records the resumable
+ * pane running a Claude Code, Codex, or Amp CLI session, records the resumable
  * session id. `restore` reopens Ghostty with the same tabs/panes and
- * auto-resumes each session via `claude --resume <id>` / `codex resume <id>`.
+ * auto-resumes each session via `claude --resume <id>` / `codex resume <id>` /
+ * `amp threads continue <id>`.
  *
  * Join mechanism: a running agent process's start time matches the birth-time
  * of its session transcript; Claude's `aiTitle` field is a second confirm
- * against the live pane title.
+ * against the live pane title. Amp is exact: each `amp` process holds its
+ * thread log (~/.cache/amp/logs/threads/T-<id>.log) open, so lsof yields the
+ * thread id directly.
  *
  * Requirements: macOS, Ghostty >= 1.3.0 (AppleScript dictionary), Node >= 18 or Bun.
  * License: MIT.
@@ -58,16 +61,20 @@ function runningAgents() {
     let tool = null;
     if (/(^|\/)claude(\s|$)/.test(cmd) && !/codex/.test(cmd)) tool = "claude";
     else if (/@openai\/codex.*\/bin\/codex|codex-[a-z0-9-]+\/vendor.*\/bin\/codex/.test(cmd)) tool = "codex";
-    if (tool && pid) procs.push({ pid, lstart, tool });
+    else if (/(^|\/)amp(\s|$)/.test(cmd) && !/claude|codex/.test(cmd)) tool = "amp";
+    if (tool && pid) procs.push({ pid, lstart, tool, cmd });
   }
   if (!procs.length) return [];
   const cwds = cwdOf(procs.map((p) => p.pid));
+  const ampIds = ampThreadIdsOf(procs.filter((p) => p.tool === "amp").map((p) => p.pid));
   const agents = [];
   for (const p of procs) {
     const cwd = cwds.get(p.pid);
     if (!cwd) continue;
-    const a = { tool: p.tool, pid: p.pid, cwd, lstart: p.lstart, sessionId: undefined, title: undefined };
-    if (p.tool === "claude") resolveClaude(a); else resolveCodex(a);
+    const a = { tool: p.tool, pid: p.pid, cwd, lstart: p.lstart, cmd: p.cmd, sessionId: undefined, title: undefined };
+    if (p.tool === "claude") resolveClaude(a);
+    else if (p.tool === "amp") resolveAmp(a, ampIds);
+    else resolveCodex(a);
     agents.push(a);
   }
   return agents;
@@ -171,6 +178,60 @@ function resolveCodex(a) {
   a.sessionId = cands[0].uuid;
 }
 
+// Amp keeps each thread's transcript server-side, but a running `amp` process
+// holds its local thread log open at ~/.cache/amp/logs/threads/T-<id>.log and
+// mirrors the thread to ~/.local/share/amp/threads/T-<id>.json. The open log
+// gives an authoritative pid -> thread-id mapping (no birth-time guessing).
+const AMP_THREADS_DIR = join(HOME, ".local", "share", "amp", "threads");
+const AMP_LOG_DIR = join(HOME, ".cache", "amp", "logs", "threads");
+const AMP_ID_RE = /T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+
+function ampThreadIdsOf(pids) {
+  // One batched lsof for all amp pids (like cwdOf), parsed via -Fpn field output.
+  const m = new Map();
+  if (!pids.length) return m;
+  const out = sh(["lsof", "-p", pids.join(","), "-Fpn"]);
+  let cur = 0;
+  for (const line of out.split("\n")) {
+    if (line[0] === "p") cur = parseInt(line.slice(1), 10);
+    else if (line[0] === "n" && !m.has(cur)) {
+      const hit = line.slice(1).match(/\/logs\/threads\/(T-[0-9a-f-]+)\.log/);
+      if (hit) m.set(cur, hit[1]);
+    }
+  }
+  return m;
+}
+function ampTitleFromLog(id) {
+  // Active threads aren't flushed to the thread store yet; the live title is in
+  // the open log. Read only the tail — titles are logged repeatedly, last wins.
+  const file = join(AMP_LOG_DIR, id + ".log");
+  try {
+    const tail = sh(["tail", "-c", "524288", file]);
+    const m = tail.match(/"title":"((?:[^"\\]|\\.)*)"/g);
+    if (m && m.length) {
+      const last = m[m.length - 1].match(/"title":"((?:[^"\\]|\\.)*)"/);
+      if (last) return JSON.parse('"' + last[1] + '"');
+    }
+  } catch (_) {}
+  return undefined;
+}
+function ampTitleOf(id) {
+  try {
+    const d = JSON.parse(readFileSync(join(AMP_THREADS_DIR, id + ".json"), "utf8"));
+    if (d && d.title) return d.title;
+  } catch (_) {}
+  return ampTitleFromLog(id);
+}
+function resolveAmp(a, ampIds) {
+  // 1) Authoritative: the open thread log file held by this process.
+  let id = ampIds.get(a.pid);
+  // 2) Fallback: an id passed on the launch command (amp threads continue T-...).
+  if (!id && a.cmd) { const m = a.cmd.match(AMP_ID_RE); if (m) id = m[0]; }
+  if (!id) return;
+  a.sessionId = id;
+  a.title = ampTitleOf(id);
+}
+
 // ---------- layout capture ----------
 const CAPTURE = `set US to (ASCII character 31)
 set LF to (ASCII character 10)
@@ -219,11 +280,11 @@ function resolvePane(cwd, title, agents, used, usedIds) {
     const m = claudeSessionsCached(cwd).filter((s) => !usedIds.has(s.id) && aiTitleOf(s.file) === clean);
     if (m.length) { usedIds.add(m[0].id); return { cwd, title: clean, tool: "claude", sessionId: m[0].id }; }
   }
-  // 2) Codex running in this cwd.
-  let a = agents.find((x) => !used.has(x) && x.tool === "codex" && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
+  // 2) Codex or Amp running in this cwd.
+  let a = agents.find((x) => !used.has(x) && (x.tool === "codex" || x.tool === "amp") && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
   // 3) Any running agent in this cwd whose session id is not already taken.
   if (!a) a = agents.find((x) => !used.has(x) && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
-  if (a) { used.add(a); if (a.sessionId) usedIds.add(a.sessionId); return { cwd, title: clean, tool: a.tool, sessionId: a.sessionId }; }
+  if (a) { used.add(a); if (a.sessionId) usedIds.add(a.sessionId); return { cwd, title: clean || a.title || "", tool: a.tool, sessionId: a.sessionId }; }
   return { cwd, title: clean, tool: "shell" };
 }
 
@@ -231,6 +292,7 @@ function resolvePane(cwd, title, agents, used, usedIds) {
 function resumeCmd(p) {
   if (p.tool === "claude") return p.sessionId ? `claude --resume ${p.sessionId}` : "claude --continue";
   if (p.tool === "codex") return p.sessionId ? `codex resume ${p.sessionId}` : "codex resume --last";
+  if (p.tool === "amp") return p.sessionId ? `amp threads continue ${p.sessionId}` : "amp";
   return null;
 }
 function aesc(s) { return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"'); }
@@ -319,7 +381,7 @@ if (cmd === "backup") {
 } else if (cmd === "show") {
   console.log(summarize(load(name)));
 } else {
-  console.log(`ghostty-resurrect — back up & restore Ghostty tabs, panes, and Claude/Codex sessions
+  console.log(`ghostty-resurrect — back up & restore Ghostty tabs, panes, and Claude/Codex/Amp sessions
 
 Usage:
   ghostty-resurrect backup [name]              capture current Ghostty layout + sessions (default: latest)
