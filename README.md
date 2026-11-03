@@ -25,7 +25,7 @@ Ghostty has no session persistence — quit it and your carefully arranged tabs 
 No daemon, no shell hooks, no wrappers around your agents. It reconstructs everything from what's already on disk at backup time:
 
 1. **Layout** comes from Ghostty's AppleScript dictionary (added in Ghostty 1.3.0): windows, tabs, terminals, working directories, titles.
-2. **Pane → session** is the hard part. Each running `claude`/`codex` process is matched to its on-disk session transcript by **start-time ≈ transcript birth-time**. For Claude, the pane's live title is then matched against the transcript's `aiTitle` field, which makes the mapping authoritative even when several sessions share one directory.
+2. **Pane → session** is the hard part. For Claude, the pane's live title is matched against the transcript's `customTitle` (set by `/rename`) or else its `aiTitle`, which makes the mapping authoritative even when several sessions share one directory. Each running `claude` process's session id comes from `~/.claude/sessions/<pid>.json`, which holds the resumed session's id when the process was started with `--resume`. Each running `codex` process is matched to its on-disk session transcript by **start-time ≈ transcript birth-time**.
 3. **Restore** uses Ghostty's scripting verbs (`new window`, `new tab`, `split`) with a surface configuration that sets the pane's `initial working directory` and an `initial input` of the resume command — so each pane opens in the right place and resumes itself.
 
 ## Requirements
