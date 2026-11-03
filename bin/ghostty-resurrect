@@ -8,9 +8,10 @@
  * session id. `restore` reopens Ghostty with the same tabs/panes and
  * auto-resumes each session via `claude --resume <id>` / `codex resume <id>`.
  *
- * Join mechanism: a running agent process's start time matches the birth-time
- * of its session transcript; Claude's `aiTitle` field is a second confirm
- * against the live pane title.
+ * Join mechanism: Claude Code writes each live process's session id to
+ * ~/.claude/sessions/<pid>.json, and a Claude pane's live title equals its
+ * transcript's `customTitle` (set by /rename) or else its `aiTitle`. A Codex
+ * process's start time matches the birth-time of its session transcript.
  *
  * Requirements: macOS, Ghostty >= 1.3.0 (AppleScript dictionary), Node >= 18 or Bun.
  * License: MIT.
@@ -66,7 +67,7 @@ function runningAgents() {
   for (const p of procs) {
     const cwd = cwds.get(p.pid);
     if (!cwd) continue;
-    const a = { tool: p.tool, pid: p.pid, cwd, lstart: p.lstart, sessionId: undefined, title: undefined };
+    const a = { tool: p.tool, pid: p.pid, cwd, lstart: p.lstart, sessionId: undefined };
     if (p.tool === "claude") resolveClaude(a); else resolveCodex(a);
     agents.push(a);
   }
@@ -87,13 +88,13 @@ function cwdOf(pids) {
 
 function encClaudeDir(cwd) { return cwd.replace(/[/._]/g, "-"); }
 
-function lastAiTitle(file) {
+// The tab shows the /rename title (customTitle) when set, else the generated aiTitle.
+function shownTitle(file) {
   try {
     const data = readFileSync(file, "utf8");
-    const m = data.match(/"aiTitle":"((?:[^"\\]|\\.)*)"/g);
-    if (m && m.length) {
-      const last = m[m.length - 1].match(/"aiTitle":"((?:[^"\\]|\\.)*)"/);
-      if (last) return JSON.parse('"' + last[1] + '"');
+    for (const key of ["customTitle", "aiTitle"]) {
+      const m = data.match(new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`, "g"));
+      if (m && m.length) return JSON.parse(m[m.length - 1].slice(key.length + 3));
     }
   } catch (_) {}
   return undefined;
@@ -107,7 +108,7 @@ function claudeSessionsFor(cwd) {
     if (!f.endsWith(".jsonl")) continue;
     const file = join(dir, f);
     let st; try { st = statSync(file); } catch (_) { continue; }
-    res.push({ id: f.replace(/\.jsonl$/, ""), file, btime: birthtime(file), mtime: Math.floor(st.mtimeMs / 1000) });
+    res.push({ id: f.replace(/\.jsonl$/, ""), file, mtime: Math.floor(st.mtimeMs / 1000) });
   }
   return res;
 }
@@ -119,18 +120,17 @@ function claudeSessionsCached(cwd) {
   if (!s) { s = claudeSessionsFor(cwd).sort((a, b) => b.mtime - a.mtime).slice(0, 80); _sessByCwd.set(cwd, s); }
   return s;
 }
-const _aiTitle = new Map();
-function aiTitleOf(file) {
-  if (_aiTitle.has(file)) return _aiTitle.get(file);
-  const t = lastAiTitle(file); _aiTitle.set(file, t); return t;
+const _shownTitle = new Map();
+function shownTitleOf(file) {
+  if (_shownTitle.has(file)) return _shownTitle.get(file);
+  const t = shownTitle(file); _shownTitle.set(file, t); return t;
 }
 
+// Claude Code records each live process's current session in ~/.claude/sessions/<pid>.json.
 function resolveClaude(a) {
-  const cands = claudeSessionsFor(a.cwd);
-  if (!cands.length) return;
-  cands.sort((x, y) => Math.abs(x.btime - a.lstart) - Math.abs(y.btime - a.lstart));
-  a.sessionId = cands[0].id;
-  a.title = lastAiTitle(cands[0].file);
+  const f = join(HOME, ".claude", "sessions", `${a.pid}.json`);
+  if (!existsSync(f)) return;
+  a.sessionId = JSON.parse(readFileSync(f, "utf8")).sessionId;
 }
 
 let codexCache = null;
@@ -213,10 +213,10 @@ function capture(name) {
 
 function resolvePane(cwd, title, agents, used, usedIds) {
   const clean = stripGlyph(title);
-  // 1) Claude — authoritative: pane title equals a session transcript's aiTitle.
+  // 1) Claude — authoritative: pane title equals a session transcript's shown title.
   //    This maps each pane to its own unique session (deduped by id).
   if (clean) {
-    const m = claudeSessionsCached(cwd).filter((s) => !usedIds.has(s.id) && aiTitleOf(s.file) === clean);
+    const m = claudeSessionsCached(cwd).filter((s) => !usedIds.has(s.id) && shownTitleOf(s.file) === clean);
     if (m.length) { usedIds.add(m[0].id); return { cwd, title: clean, tool: "claude", sessionId: m[0].id }; }
   }
   // 2) Codex running in this cwd.
