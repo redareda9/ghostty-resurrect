@@ -24,15 +24,15 @@ Ghostty has no session persistence — quit it and your carefully arranged tabs 
 
 No daemon, no shell hooks, no wrappers around your agents. It reconstructs everything from what's already on disk at backup time:
 
-1. **Layout** comes from Ghostty's AppleScript dictionary (added in Ghostty 1.3.0): windows, tabs, terminals, working directories, titles.
-2. **Pane → session** is the hard part. Each running `claude`/`codex` process is matched to its on-disk session transcript by **start-time ≈ transcript birth-time**. For Claude, the pane's live title is then matched against the transcript's `aiTitle` field, which makes the mapping authoritative even when several sessions share one directory.
+1. **Layout** comes from Ghostty's AppleScript dictionary: windows, tabs, terminals, working directories, titles and each terminal's foreground PID and TTY (added in Ghostty 1.4.0).
+2. **Codex conversations** are matched by foreground process and TTY, then by the main transcript open in that process tree. Only the metadata header is read, with a 2 MiB limit. This handles standalone binaries, launcher/app-server children and old resumed or forked conversations without searching historical transcripts. Sub-agent transcripts are excluded. Claude retains its existing process start-time/transcript birth-time and `aiTitle` matching.
 3. **Restore** uses Ghostty's scripting verbs (`new window`, `new tab`, `split`) with a surface configuration that sets the pane's `initial working directory` and an `initial input` of the resume command — so each pane opens in the right place and resumes itself.
 
 ## Requirements
 
 - **macOS** (uses AppleScript + `lsof`/`ps`/`stat`)
-- **Ghostty ≥ 1.3.0** (the AppleScript scripting dictionary)
-- **Node ≥ 18** or **[Bun](https://bun.sh)** — the CLI is a single dependency-free script
+- **Ghostty 1.4.0 or newer** (foreground PID and TTY in the AppleScript scripting dictionary)
+- **Node 18 or newer** or **[Bun](https://bun.sh)** - the CLI has no package dependencies; keep the adjacent `lib` directory when symlinking it
 - [Claude Code](https://www.claude.com/product/claude-code) and/or [Codex CLI](https://developers.openai.com/codex/cli) if you want session resume (layout backup works without them)
 
 ## Install
@@ -80,6 +80,14 @@ Saved -> ~/.config/ghostty-resurrect/latest.json
 ```
 
 Snapshots are plain JSON in `~/.config/ghostty-resurrect/` — easy to inspect, edit, or commit.
+
+Codex captures require one identifiable open main transcript for each foreground Codex pane. An empty new session, missing transcript, process race or ambiguous identity fails the capture before replacing the previous backup. Start a resumable conversation or resolve the ambiguity, then retry. A saved Codex pane without a valid conversation ID cannot be restored; take a new backup instead of resuming an unrelated latest conversation.
+
+Codex restoration uses the project directory recorded in the transcript and preserves a custom `CODEX_HOME` when present. Terminal scrollback, process memory and running commands are not captured.
+
+## Tests
+
+Run `npm test` for the dependency-free Node test suite. Fixtures cover native and npm binaries, process trees, same-directory panes, resumed and forked conversations, sub-agents, uncertain identities and bounded metadata reads. Tests isolate their filesystem and process data from live sessions.
 
 ## Claude Code skills (optional)
 

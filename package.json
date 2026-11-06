@@ -6,6 +6,7 @@
     "ghostty-resurrect": "bin/ghostty-resurrect"
   },
   "scripts": {
+    "test": "node --test --test-reporter=tap",
     "backup": "node bin/ghostty-resurrect backup",
     "restore": "node bin/ghostty-resurrect restore"
   },
@@ -39,6 +40,7 @@
   ],
   "files": [
     "bin/",
+    "lib/",
     "skills/",
     "README.md",
     "LICENSE"
