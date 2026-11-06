@@ -8,11 +8,10 @@
  * session id. `restore` reopens Ghostty with the same tabs/panes and
  * auto-resumes each session via `claude --resume <id>` / `codex resume <id>`.
  *
- * Join mechanism: a running agent process's start time matches the birth-time
- * of its session transcript; Claude's `aiTitle` field is a second confirm
- * against the live pane title.
+ * Codex uses each pane's foreground process and open main transcript. Claude
+ * uses process start-time/transcript birth-time and the live pane title.
  *
- * Requirements: macOS, Ghostty >= 1.3.0 (AppleScript dictionary), Node >= 18 or Bun.
+ * Requirements: macOS, Ghostty >= 1.4.0 (AppleScript dictionary), Node >= 18 or Bun.
  * License: MIT.
  */
 "use strict";
@@ -25,6 +24,7 @@ const {
 
 const HOME = homedir();
 const STORE = join(HOME, ".config", "ghostty-resurrect");
+const { UUID, inspectProcesses, resolvePane: resolveCodexPane } = require("../lib/codex");
 const US = ""; // field separator emitted by the capture AppleScript
 
 // ---------- shell helpers ----------
@@ -57,7 +57,6 @@ function runningAgents() {
     const cmd = t.slice(6).join(" ");
     let tool = null;
     if (/(^|\/)claude(\s|$)/.test(cmd) && !/codex/.test(cmd)) tool = "claude";
-    else if (/@openai\/codex.*\/bin\/codex|codex-[a-z0-9-]+\/vendor.*\/bin\/codex/.test(cmd)) tool = "codex";
     if (tool && pid) procs.push({ pid, lstart, tool });
   }
   if (!procs.length) return [];
@@ -67,7 +66,7 @@ function runningAgents() {
     const cwd = cwds.get(p.pid);
     if (!cwd) continue;
     const a = { tool: p.tool, pid: p.pid, cwd, lstart: p.lstart, sessionId: undefined, title: undefined };
-    if (p.tool === "claude") resolveClaude(a); else resolveCodex(a);
+    resolveClaude(a);
     agents.push(a);
   }
   return agents;
@@ -133,44 +132,6 @@ function resolveClaude(a) {
   a.title = lastAiTitle(cands[0].file);
 }
 
-let codexCache = null;
-function allCodexSessions() {
-  if (codexCache) return codexCache;
-  const root = join(HOME, ".codex", "sessions");
-  const out = [];
-  const cutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
-  function walk(d) {
-    let ents; try { ents = readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
-    for (const e of ents) {
-      const p = join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
-        const um = e.name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
-        if (!um) continue;
-        let st; try { st = statSync(p); } catch (_) { continue; }
-        if (st.mtimeMs / 1000 < cutoff) continue;
-        let cwd = "";
-        try {
-          const head = readFileSync(p, "utf8").slice(0, 4000);
-          const cm = head.match(/"cwd":"((?:[^"\\]|\\.)*)"/);
-          if (cm) cwd = JSON.parse('"' + cm[1] + '"');
-        } catch (_) {}
-        out.push({ uuid: um[1], cwd, btime: birthtime(p) });
-      }
-    }
-  }
-  walk(root);
-  codexCache = out;
-  return out;
-}
-
-function resolveCodex(a) {
-  const cands = allCodexSessions().filter((s) => s.cwd === a.cwd);
-  if (!cands.length) return;
-  cands.sort((x, y) => Math.abs(x.btime - a.lstart) - Math.abs(y.btime - a.lstart));
-  a.sessionId = cands[0].uuid;
-}
-
 // ---------- layout capture ----------
 const CAPTURE = `set US to (ASCII character 31)
 set LF to (ASCII character 10)
@@ -183,7 +144,7 @@ tell application "Ghostty"
       if selected of t then set sel to "1"
       set out to out & "T" & US & sel & US & (name of t) & LF
       repeat with trm in terminals of t
-        set out to out & "P" & US & (working directory of trm) & US & (name of trm) & LF
+        set out to out & "P" & US & (working directory of trm) & US & (name of trm) & US & (id of trm) & US & (pid of trm) & US & (tty of trm) & LF
       end repeat
     end repeat
   end repeat
@@ -192,7 +153,8 @@ return out`;
 
 function capture(name) {
   const raw = osascript(CAPTURE);
-  if (!raw.trim()) { console.error("No Ghostty windows found (is Ghostty running, and is it >= 1.3.0?)."); process.exit(1); }
+  if (!raw.trim()) { console.error("No Ghostty windows found (is Ghostty running, and is it >= 1.4.0?)."); process.exit(1); }
+  const codex = inspectProcesses();
   const agents = runningAgents();
   const used = new Set();        // running-agent objects already claimed
   const usedIds = new Set();     // session ids already assigned (dedup across panes)
@@ -205,7 +167,14 @@ function capture(name) {
       curTab = { name: parts[2] || "", selected: parts[1] === "1", panes: [] };
       curWin.tabs.push(curTab);
     } else if (parts[0] === "P" && curTab) {
-      curTab.panes.push(resolvePane(parts[1] || HOME, parts[2] || "", agents, used, usedIds));
+      if (parts.length !== 6 || !parts[3] || !/^\d+$/.test(parts[4])) throw new Error("Invalid Ghostty pane data");
+      const pane = { cwd: parts[1] || HOME, title: parts[2] || "", terminalId: parts[3], pid: Number(parts[4]), tty: parts[5] };
+      const resolved = resolveCodexPane(pane, codex.procs, codex.files);
+      if (resolved) {
+        if (usedIds.has(resolved.sessionId)) throw new Error("Codex conversation appears in multiple panes; previous backup retained");
+        usedIds.add(resolved.sessionId);
+      }
+      curTab.panes.push(resolved || resolvePane(pane.cwd, pane.title, agents, used, usedIds));
     }
   }
   return { name, savedAt: new Date().toISOString(), windows };
@@ -219,10 +188,8 @@ function resolvePane(cwd, title, agents, used, usedIds) {
     const m = claudeSessionsCached(cwd).filter((s) => !usedIds.has(s.id) && aiTitleOf(s.file) === clean);
     if (m.length) { usedIds.add(m[0].id); return { cwd, title: clean, tool: "claude", sessionId: m[0].id }; }
   }
-  // 2) Codex running in this cwd.
-  let a = agents.find((x) => !used.has(x) && x.tool === "codex" && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
-  // 3) Any running agent in this cwd whose session id is not already taken.
-  if (!a) a = agents.find((x) => !used.has(x) && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
+  // 2) A running Claude process in this cwd whose session id is not already taken.
+  const a = agents.find((x) => !used.has(x) && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
   if (a) { used.add(a); if (a.sessionId) usedIds.add(a.sessionId); return { cwd, title: clean, tool: a.tool, sessionId: a.sessionId }; }
   return { cwd, title: clean, tool: "shell" };
 }
@@ -230,7 +197,12 @@ function resolvePane(cwd, title, agents, used, usedIds) {
 // ---------- restore ----------
 function resumeCmd(p) {
   if (p.tool === "claude") return p.sessionId ? `claude --resume ${p.sessionId}` : "claude --continue";
-  if (p.tool === "codex") return p.sessionId ? `codex resume ${p.sessionId}` : "codex resume --last";
+  if (p.tool === "codex") {
+    if (!UUID.test(p.sessionId || "")) throw new Error("Saved Codex pane has no valid conversation ID; take a new backup");
+    const quote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
+    const prefix = p.sessionHome && p.sessionHome !== join(HOME, ".codex") ? `CODEX_HOME=${quote(p.sessionHome)} ` : "";
+    return `${prefix}codex resume ${p.sessionId}`;
+  }
   return null;
 }
 function aesc(s) { return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"'); }
